@@ -1,4 +1,4 @@
-# DevOps POC – CI/CD Pipeline with Jenkins, Docker, Kubernetes & Prometheus
+**CI/CD Pipeline with Jenkins, Docker, Kubernetes & Prometheus**
 
 > Node.js application fully containerised and deployed via a Jenkins pipeline to a
 > Kubernetes cluster, with Prometheus + Grafana monitoring.
