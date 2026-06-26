@@ -1,0 +1,321 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Prometheus – ClusterRole / ClusterRoleBinding / ServiceAccount
+# Required for Prometheus to scrape pods/services/endpoints across namespaces.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: devops-poc
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/proxy, services, endpoints, pods]
+    verbs: [get, list, watch]
+  - apiGroups: [extensions, networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch]
+  - nonResourceURLs: [/metrics, /metrics/cadvisor]
+    verbs: [get]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: devops-poc
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# ConfigMap – prometheus.yml
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: devops-poc
+  labels:
+    app: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval:     15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: devops-poc-cluster
+        env:     production
+
+    # ── Alerting (connect to Alertmanager if deployed) ──────────────────────
+    # alerting:
+    #   alertmanagers:
+    #     - static_configs:
+    #         - targets: ["alertmanager:9093"]
+
+    # ── Rules files ─────────────────────────────────────────────────────────
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    # ── Scrape configs ───────────────────────────────────────────────────────
+    scrape_configs:
+
+      # Prometheus itself
+      - job_name: prometheus
+        static_configs:
+          - targets: [localhost:9090]
+
+      # ── Auto-discover pods with annotation prometheus.io/scrape: "true" ───
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [devops-poc]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: kubernetes_pod_name
+
+      # ── Scrape services with annotation prometheus.io/scrape: "true" ──────
+      - job_name: kubernetes-services
+        kubernetes_sd_configs:
+          - role: service
+            namespaces:
+              names: [devops-poc]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_service_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            target_label: kubernetes_service_name
+
+      # ── Node-level metrics via node-exporter ─────────────────────────────
+      - job_name: node-exporter
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics
+
+      # ── cAdvisor – container CPU/memory ──────────────────────────────────
+      - job_name: kubernetes-cadvisor
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+
+  # ── Alert rules ─────────────────────────────────────────────────────────────
+  alert_rules.yml: |
+    groups:
+      - name: devops-poc-app-alerts
+        rules:
+          - alert: AppDown
+            expr: up{job="kubernetes-pods", app="devops-poc-app"} == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "devops-poc-app pod is down"
+              description: "Pod {{ $labels.kubernetes_pod_name }} has been down for > 1 minute."
+
+          - alert: HighCPUUsage
+            expr: >
+              rate(container_cpu_usage_seconds_total{namespace="devops-poc",
+                container="devops-poc-app"}[5m]) * 100 > 80
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High CPU usage on devops-poc-app"
+              description: "CPU usage > 80% for 5 minutes on {{ $labels.pod }}."
+
+          - alert: HighMemoryUsage
+            expr: >
+              container_memory_usage_bytes{namespace="devops-poc",
+                container="devops-poc-app"}
+              / container_spec_memory_limit_bytes{namespace="devops-poc",
+                container="devops-poc-app"} * 100 > 80
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High memory usage on devops-poc-app"
+              description: "Memory usage > 80% for 5 minutes on {{ $labels.pod }}."
+
+          - alert: HighHttpErrorRate
+            expr: >
+              rate(http_requests_total{status_code=~"5.."}[5m])
+              / rate(http_requests_total[5m]) * 100 > 5
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "High HTTP 5xx error rate"
+              description: "More than 5% of requests returning 5xx for 2+ minutes."
+
+          - alert: SlowResponseTime
+            expr: >
+              histogram_quantile(0.95,
+                rate(http_request_duration_seconds_bucket[5m])) > 1
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Slow p95 response time"
+              description: "p95 response time > 1 second for 5 minutes."
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Prometheus Deployment
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: devops-poc
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.51.2
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=15d
+            - --web.console.libraries=/usr/share/prometheus/console_libraries
+            - --web.console.templates=/usr/share/prometheus/consoles
+            - --web.enable-lifecycle             # allows hot-reload via POST /-/reload
+          ports:
+            - name: web
+              containerPort: 9090
+          resources:
+            requests:
+              cpu:    "250m"
+              memory: "512Mi"
+            limits:
+              cpu:    "500m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: web
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: web
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: rules
+              mountPath: /etc/prometheus/rules
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+            items:
+              - key: prometheus.yml
+                path: prometheus.yml
+        - name: rules
+          configMap:
+            name: prometheus-config
+            items:
+              - key: alert_rules.yml
+                path: alert_rules.yml
+        - name: data
+          emptyDir: {}    # use a PersistentVolumeClaim in production
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Prometheus Service
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-svc
+  namespace: devops-poc
+  labels:
+    app: prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: prometheus
+  ports:
+    - name: web
+      port: 9090
+      targetPort: web

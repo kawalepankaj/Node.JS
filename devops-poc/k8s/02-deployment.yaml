@@ -1,0 +1,154 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Deployment – devops-poc-app
+#
+# Key production practices included:
+#   • RollingUpdate strategy with maxSurge/maxUnavailable
+#   • Resource requests & limits (prevents noisy-neighbour issues)
+#   • Liveness, Readiness, and Startup probes
+#   • Pod Disruption Budget (see 03-pdb.yaml)
+#   • Pod anti-affinity for HA across nodes
+#   • Security context (non-root, read-only root filesystem)
+#   • ConfigMap & Secret injection via envFrom
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devops-poc-app
+  namespace: devops-poc
+  labels:
+    app: devops-poc-app
+    version: "1.0.0"
+    tier: backend
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+spec:
+  # ── Scaling ────────────────────────────────────────────────────────────────
+  replicas: 2      # horizontal scale; pair with HPA for auto-scaling
+
+  selector:
+    matchLabels:
+      app: devops-poc-app
+
+  # ── Update strategy ────────────────────────────────────────────────────────
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1         # one extra pod during rollout
+      maxUnavailable: 0   # zero downtime
+
+  # ── Pod template ───────────────────────────────────────────────────────────
+  template:
+    metadata:
+      labels:
+        app: devops-poc-app
+        version: "1.0.0"
+      annotations:
+        # Prometheus auto-discovery scrape annotations
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "3000"
+        prometheus.io/path:   "/metrics"
+
+    spec:
+      # ── Security context (pod-level) ───────────────────────────────────────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+
+      # ── Affinity: spread pods across nodes for HA ──────────────────────────
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: [devops-poc-app]
+                topologyKey: kubernetes.io/hostname
+
+      # ── Graceful shutdown ──────────────────────────────────────────────────
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: devops-poc-app
+          # Jenkins pipeline overwrites this tag on every deployment
+          image: docker.io/<YOUR_DOCKERHUB_USER>/devops-poc-app:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+
+          # ── Environment from ConfigMap & Secret ─────────────────────────────
+          envFrom:
+            - configMapRef:
+                name: devops-poc-config
+            - secretRef:
+                name: devops-poc-secret
+
+          # ── Additional individual env vars ──────────────────────────────────
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          # ── Resource management ─────────────────────────────────────────────
+          resources:
+            requests:
+              cpu:    "100m"
+              memory: "128Mi"
+            limits:
+              cpu:    "500m"
+              memory: "512Mi"
+
+          # ── Startup probe: allow 60 s for the app to initialise ─────────────
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 12
+            periodSeconds: 5
+
+          # ── Liveness probe: restart container if it hangs ───────────────────
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          # ── Readiness probe: remove pod from LB if not ready ────────────────
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          # ── Security context (container-level) ──────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          # ── Writable tmp volume for read-only root FS ───────────────────────
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}

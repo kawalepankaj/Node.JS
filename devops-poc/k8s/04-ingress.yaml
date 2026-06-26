@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Ingress – expose the service externally via NGINX Ingress Controller
+#
+# Prerequisites:
+#   kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/
+#     controller-v1.10.0/deploy/static/provider/aws/deploy.yaml
+#
+# For TLS: install cert-manager and uncomment the annotations below.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: devops-poc-app-ingress
+  namespace: devops-poc
+  labels:
+    app: devops-poc-app
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    # ── TLS via cert-manager (uncomment when cert-manager is installed) ──────
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  # ── TLS (uncomment and update host) ────────────────────────────────────────
+  # tls:
+  #   - hosts:
+  #       - devops-poc.example.com
+  #     secretName: devops-poc-tls
+
+  rules:
+    - host: devops-poc.example.com   # ← replace with your actual domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: devops-poc-app-svc
+                port:
+                  name: http

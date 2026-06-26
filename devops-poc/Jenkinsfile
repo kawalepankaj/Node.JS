@@ -1,0 +1,296 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Jenkins Declarative Pipeline
+//  DevOps POC – Build → Test → Push → Deploy
+//
+//  Prerequisites (Jenkins Credentials):
+//    DOCKER_HUB_CREDS  – Username/Password  (Docker Hub login)
+//    KUBECONFIG_SECRET – Secret File        (kubeconfig for target cluster)
+//    SONAR_TOKEN       – Secret Text        (SonarQube/Cloud auth token)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+
+  agent any
+
+  // ── Toolchain ──────────────────────────────────────────────────────────────
+  tools {
+    nodejs 'NodeJS-18'   // configure this name in Jenkins → Global Tool Config
+  }
+
+  // ── Environment variables ──────────────────────────────────────────────────
+  environment {
+    APP_NAME        = 'devops-poc-app'
+    DOCKER_REGISTRY = 'docker.io'
+    IMAGE_NAME      = "${DOCKER_REGISTRY}/${DOCKER_HUB_USER}/${APP_NAME}"
+    IMAGE_TAG       = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+    K8S_NAMESPACE   = 'devops-poc'
+    K8S_DEPLOYMENT  = 'devops-poc-app'
+    SONAR_PROJECT   = 'devops-poc-app'
+  }
+
+  // ── Pipeline options ───────────────────────────────────────────────────────
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    timeout(time: 30, unit: 'MINUTES')
+    timestamps()
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+  }
+
+  // ── Trigger: poll GitHub every 2 minutes (or use webhook) ─────────────────
+  triggers {
+    pollSCM('H/2 * * * *')
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  STAGES
+  // ═══════════════════════════════════════════════════════════════════════════
+  stages {
+
+    // ── 1. Checkout ───────────────────────────────────────────────────────────
+    stage('Checkout') {
+      steps {
+        echo '📥 Checking out source code …'
+        checkout scm
+        script {
+          env.GIT_COMMIT_MSG = sh(
+            script: 'git log -1 --pretty=%B',
+            returnStdout: true
+          ).trim()
+          env.GIT_AUTHOR = sh(
+            script: 'git log -1 --pretty=%an',
+            returnStdout: true
+          ).trim()
+        }
+        echo "Commit: ${env.GIT_COMMIT_MSG} by ${env.GIT_AUTHOR}"
+      }
+    }
+
+    // ── 2. Install Dependencies ───────────────────────────────────────────────
+    stage('Install Dependencies') {
+      steps {
+        dir('app') {
+          echo '📦 Installing npm dependencies …'
+          sh 'npm ci'
+        }
+      }
+    }
+
+    // ── 3. Code Quality & Security ────────────────────────────────────────────
+    stage('Code Quality') {
+      parallel {
+
+        stage('Lint') {
+          steps {
+            dir('app') {
+              echo '🔍 Running ESLint …'
+              sh 'npm run lint || true'   // non-blocking; make blocking when rules are stable
+            }
+          }
+        }
+
+        stage('Dependency Audit') {
+          steps {
+            dir('app') {
+              echo '🔒 Auditing npm dependencies for vulnerabilities …'
+              sh 'npm audit --audit-level=high || true'
+            }
+          }
+        }
+
+      }
+    }
+
+    // ── 4. Unit Tests ─────────────────────────────────────────────────────────
+    stage('Unit Tests') {
+      steps {
+        dir('app') {
+          echo '🧪 Running unit tests …'
+          sh 'npm test -- --ci --reporters=default --reporters=jest-junit'
+        }
+      }
+      post {
+        always {
+          junit 'app/junit.xml'
+          publishHTML([
+            allowMissing: false,
+            alwaysLinkToLastBuild: true,
+            keepAll: true,
+            reportDir: 'app/coverage/lcov-report',
+            reportFiles: 'index.html',
+            reportName: 'Coverage Report'
+          ])
+        }
+      }
+    }
+
+    // ── 5. SonarQube Analysis ─────────────────────────────────────────────────
+    stage('SonarQube Analysis') {
+      when {
+        branch 'main'
+      }
+      steps {
+        withSonarQubeEnv('SonarQube') {
+          dir('app') {
+            sh """
+              npx sonar-scanner \
+                -Dsonar.projectKey=${SONAR_PROJECT} \
+                -Dsonar.sources=. \
+                -Dsonar.exclusions=node_modules/**,coverage/**,**/*.test.js \
+                -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            """
+          }
+        }
+      }
+    }
+
+    // ── 6. Build Docker Image ─────────────────────────────────────────────────
+    stage('Build Docker Image') {
+      steps {
+        echo "🐳 Building Docker image ${IMAGE_NAME}:${IMAGE_TAG} …"
+        dir('app') {
+          sh """
+            docker build \
+              --build-arg APP_VERSION=${IMAGE_TAG} \
+              --build-arg BUILD_DATE=\$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+              --cache-from ${IMAGE_NAME}:latest \
+              -t ${IMAGE_NAME}:${IMAGE_TAG} \
+              -t ${IMAGE_NAME}:latest \
+              .
+          """
+        }
+      }
+    }
+
+    // ── 7. Trivy Image Scan ───────────────────────────────────────────────────
+    stage('Image Security Scan') {
+      steps {
+        echo '🛡️  Scanning Docker image with Trivy …'
+        sh """
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v \$HOME/.cache:/root/.cache \
+            aquasec/trivy:latest image \
+              --exit-code 1 \
+              --severity HIGH,CRITICAL \
+              --no-progress \
+              ${IMAGE_NAME}:${IMAGE_TAG} || true
+        """
+      }
+    }
+
+    // ── 8. Push to Registry ───────────────────────────────────────────────────
+    stage('Push to Docker Hub') {
+      steps {
+        echo "📤 Pushing image to ${DOCKER_REGISTRY} …"
+        withCredentials([usernamePassword(
+          credentialsId: 'DOCKER_HUB_CREDS',
+          usernameVariable: 'DOCKER_HUB_USER',
+          passwordVariable: 'DOCKER_HUB_PASS'
+        )]) {
+          sh """
+            echo \$DOCKER_HUB_PASS | docker login ${DOCKER_REGISTRY} \
+              -u \$DOCKER_HUB_USER --password-stdin
+            docker push ${IMAGE_NAME}:${IMAGE_TAG}
+            docker push ${IMAGE_NAME}:latest
+          """
+        }
+      }
+    }
+
+    // ── 9. Deploy to Kubernetes ───────────────────────────────────────────────
+    stage('Deploy to Kubernetes') {
+      when {
+        anyOf {
+          branch 'main'
+          branch 'release/*'
+        }
+      }
+      steps {
+        echo "🚀 Deploying ${IMAGE_NAME}:${IMAGE_TAG} to Kubernetes (${K8S_NAMESPACE}) …"
+        withCredentials([file(
+          credentialsId: 'KUBECONFIG_SECRET',
+          variable: 'KUBECONFIG'
+        )]) {
+          sh """
+            # Ensure namespace exists
+            kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | \
+              kubectl apply -f -
+
+            # Apply all manifests
+            kubectl apply -f k8s/ -n ${K8S_NAMESPACE}
+
+            # Perform a rolling update by setting the new image tag
+            kubectl set image deployment/${K8S_DEPLOYMENT} \
+              ${K8S_DEPLOYMENT}=${IMAGE_NAME}:${IMAGE_TAG} \
+              -n ${K8S_NAMESPACE}
+
+            # Wait for rollout to complete (5 min timeout)
+            kubectl rollout status deployment/${K8S_DEPLOYMENT} \
+              -n ${K8S_NAMESPACE} \
+              --timeout=300s
+          """
+        }
+      }
+    }
+
+    // ── 10. Smoke Test ────────────────────────────────────────────────────────
+    stage('Smoke Test') {
+      when {
+        branch 'main'
+      }
+      steps {
+        echo '💨 Running post-deploy smoke tests …'
+        withCredentials([file(credentialsId: 'KUBECONFIG_SECRET', variable: 'KUBECONFIG')]) {
+          sh """
+            # Retrieve the service external IP/hostname (LoadBalancer)
+            APP_URL=\$(kubectl get svc ${K8S_DEPLOYMENT}-svc \
+              -n ${K8S_NAMESPACE} \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+            # Retry /health endpoint up to 10 times
+            for i in \$(seq 1 10); do
+              STATUS=\$(curl -s -o /dev/null -w '%{http_code}' http://\$APP_URL/health)
+              if [ "\$STATUS" = "200" ]; then
+                echo "✅ Smoke test passed (HTTP \$STATUS)"
+                exit 0
+              fi
+              echo "Attempt \$i – HTTP \$STATUS, retrying in 10s …"
+              sleep 10
+            done
+            echo "❌ Smoke test failed after 10 attempts"
+            exit 1
+          """
+        }
+      }
+    }
+
+  } // end stages
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  POST-PIPELINE NOTIFICATIONS
+  // ═══════════════════════════════════════════════════════════════════════════
+  post {
+
+    success {
+      echo "✅ Pipeline succeeded for ${IMAGE_TAG}"
+      // Uncomment to enable Slack notifications:
+      // slackSend channel: '#devops', color: 'good',
+      //   message: "✅ *${APP_NAME}* build *${IMAGE_TAG}* deployed successfully."
+    }
+
+    failure {
+      echo "❌ Pipeline failed for ${IMAGE_TAG}"
+      // slackSend channel: '#devops', color: 'danger',
+      //   message: "❌ *${APP_NAME}* build *${IMAGE_TAG}* FAILED. Check ${BUILD_URL}"
+    }
+
+    always {
+      echo '🧹 Cleaning up local Docker images …'
+      sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest || true"
+      cleanWs()
+    }
+
+  }
+
+}
